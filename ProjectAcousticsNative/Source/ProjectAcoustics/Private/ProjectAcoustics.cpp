@@ -5,6 +5,7 @@
 #include "ProjectAcoustics.h"
 #include "IAcoustics.h"
 #include "AcousticsDebugRender.h"
+#include "AcousticsParameterBlend.h"
 
 using namespace TritonRuntime;
 
@@ -52,6 +53,11 @@ FProjectAcousticsModule::FProjectAcousticsModule()
     , m_AceFileLoaded(false)
     , m_LastLoadCenterPosition(0, 0, 0)
     , m_LastLoadTileSize(0, 0, 0)
+    , m_PreviousTriton(nullptr)
+    , m_PreviousAceFileLoaded(false)
+    , m_IsAceCrossfadeActive(false)
+    , m_AceCrossfadeDurationSeconds(0.0f)
+    , m_AceCrossfadeElapsedSeconds(0.0f)
     , m_IsOutdoornessStale(true)
     , m_CachedOutdoorness(0)
     , m_GlobalDesign(FAcousticsDesignParams::Default())
@@ -101,6 +107,8 @@ void FProjectAcousticsModule::ShutdownModule()
         // Make sure there are no lingering background queries still running
         WaitForRunningTasks();
 
+        ClearPreviousRuntime();
+
         TritonAcoustics::DestroyInstance(m_Triton);
         TritonAcoustics::TearDown();
         m_Triton = nullptr;
@@ -111,24 +119,20 @@ void FProjectAcousticsModule::ShutdownModule()
     }
 }
 
-bool FProjectAcousticsModule::LoadAceFile(const FString& filePath, const float cacheScale)
+bool FProjectAcousticsModule::LoadAceFileIntoCurrentRuntime(const FString& filePath, const float cacheScale)
 {
     if (!m_Triton)
     {
         return false;
     }
 
-    UnloadAceFile(false);
-
     auto fullFilePath = FPaths::ProjectDir() + filePath;
     {
         SCOPE_CYCLE_COUNTER(STAT_Acoustics_LoadAce);
-        // Load the ACE file
         m_TritonIOHook = TUniquePtr<FTritonUnrealIOHook>(new FTritonUnrealIOHook());
         if (!m_TritonIOHook->OpenForRead(TCHAR_TO_ANSI(*fullFilePath)))
         {
             m_TritonIOHook.Reset();
-
             UE_LOG(LogAcousticsRuntime, Error, TEXT("Failed to open ACE file for reading: [%s]"), *fullFilePath);
             return false;
         }
@@ -137,6 +141,8 @@ bool FProjectAcousticsModule::LoadAceFile(const FString& filePath, const float c
         if (!m_Triton->InitLoad(m_TritonIOHook.Get(), m_TritonTaskHook.Get(), cacheScale))
         {
             UE_LOG(LogAcousticsRuntime, Error, TEXT("Failed to load ACE file: [%s]"), *fullFilePath);
+            m_TritonTaskHook.Reset();
+            m_TritonIOHook.Reset();
             return false;
         }
     }
@@ -148,6 +154,110 @@ bool FProjectAcousticsModule::LoadAceFile(const FString& filePath, const float c
 #endif
 
     return true;
+}
+
+bool FProjectAcousticsModule::LoadAceFile(const FString& filePath, const float cacheScale)
+{
+    if (!m_Triton)
+    {
+        return false;
+    }
+
+    UnloadAceFile(false);
+    const bool loadSuccess = LoadAceFileIntoCurrentRuntime(filePath, cacheScale);
+    if (loadSuccess)
+    {
+        ReplayDynamicOpeningsToCurrentRuntime();
+    }
+    return loadSuccess;
+}
+
+void FProjectAcousticsModule::ClearPreviousRuntime()
+{
+    if (m_PreviousTriton)
+    {
+        if (m_PreviousAceFileLoaded)
+        {
+            m_PreviousTriton->Clear();
+            m_PreviousAceFileLoaded = false;
+        }
+        TritonAcoustics::DestroyInstance(m_PreviousTriton);
+        m_PreviousTriton = nullptr;
+    }
+
+    m_PreviousTritonTaskHook.Reset();
+    m_PreviousTritonIOHook.Reset();
+    m_IsAceCrossfadeActive = false;
+    m_AceCrossfadeDurationSeconds = 0.0f;
+    m_AceCrossfadeElapsedSeconds = 0.0f;
+}
+
+bool FProjectAcousticsModule::LoadAceFileForCrossfade(
+    const FString& filePath, const float cacheScale, const float durationSeconds)
+{
+    if (!m_Triton)
+    {
+        return false;
+    }
+
+    if (!m_AceFileLoaded || durationSeconds <= 0.0f)
+    {
+        return LoadAceFile(filePath, cacheScale);
+    }
+
+    WaitForRunningTasks();
+    ClearPreviousRuntime();
+
+    m_PreviousTriton = m_Triton;
+    m_PreviousAceFileLoaded = m_AceFileLoaded;
+    m_PreviousTritonIOHook = MoveTemp(m_TritonIOHook);
+    m_PreviousTritonTaskHook = MoveTemp(m_TritonTaskHook);
+
+    m_Triton = c_UseTritonDebugInterface ? TritonAcousticsDebug::CreateInstance() : TritonAcoustics::CreateInstance();
+    m_AceFileLoaded = false;
+
+    if (!m_Triton || !LoadAceFileIntoCurrentRuntime(filePath, cacheScale))
+    {
+        if (m_Triton)
+        {
+            m_Triton->Clear();
+            TritonAcoustics::DestroyInstance(m_Triton);
+        }
+        m_Triton = m_PreviousTriton;
+        m_AceFileLoaded = m_PreviousAceFileLoaded;
+        m_TritonIOHook = MoveTemp(m_PreviousTritonIOHook);
+        m_TritonTaskHook = MoveTemp(m_PreviousTritonTaskHook);
+        m_PreviousTriton = nullptr;
+        m_PreviousAceFileLoaded = false;
+        return false;
+    }
+
+    ReplayDynamicOpeningsToCurrentRuntime();
+
+    m_IsAceCrossfadeActive = true;
+    m_AceCrossfadeDurationSeconds = durationSeconds;
+    m_AceCrossfadeElapsedSeconds = 0.0f;
+    return true;
+}
+
+void FProjectAcousticsModule::TickAceCrossfade(float deltaSeconds)
+{
+    if (!m_IsAceCrossfadeActive)
+    {
+        return;
+    }
+
+    m_AceCrossfadeElapsedSeconds += FMath::Max(0.0f, deltaSeconds);
+    if (m_AceCrossfadeElapsedSeconds >= m_AceCrossfadeDurationSeconds)
+    {
+        WaitForRunningTasks();
+        ClearPreviousRuntime();
+    }
+}
+
+bool FProjectAcousticsModule::IsAceCrossfadeActive() const
+{
+    return m_IsAceCrossfadeActive;
 }
 
 void FProjectAcousticsModule::UnloadAceFile(bool clearOldQueries)
@@ -173,6 +283,8 @@ void FProjectAcousticsModule::UnloadAceFile(bool clearOldQueries)
     }
 
     m_TritonIOHook.Reset();
+    m_TritonTaskHook.Reset();
+    ClearPreviousRuntime();
 }
 
 #if !UE_BUILD_SHIPPING
@@ -206,11 +318,11 @@ static TritonAcousticParameters MakeFreefieldParameters(const FVector& sourceLoc
 }
 #endif
 
-bool FProjectAcousticsModule::AddDynamicOpening(
-    class UAcousticsDynamicOpening* opening, const FVector& center, const FVector& normal,
+bool FProjectAcousticsModule::AddDynamicOpeningToRuntime(
+    TritonAcoustics* triton, class UAcousticsDynamicOpening* opening, const FVector& center, const FVector& normal,
     const TArray<FVector>& verticesIn)
 {
-    if (!m_Triton || verticesIn.Num() == 0)
+    if (!triton || verticesIn.Num() == 0)
     {
         return false;
     }
@@ -221,7 +333,7 @@ bool FProjectAcousticsModule::AddDynamicOpening(
         vertices.Add(AcousticsUtils::ToTritonVector(v));
     }
 
-    return m_Triton->AddDynamicOpening(
+    return triton->AddDynamicOpening(
         reinterpret_cast<uint64_t>(opening),
         AcousticsUtils::ToTritonVectorDouble(center),
         AcousticsUtils::ToTritonVector(normal),
@@ -229,25 +341,89 @@ bool FProjectAcousticsModule::AddDynamicOpening(
         &vertices[0]);
 }
 
-bool FProjectAcousticsModule::RemoveDynamicOpening(class UAcousticsDynamicOpening* opening)
+void FProjectAcousticsModule::ReplayDynamicOpeningsToCurrentRuntime()
 {
-    if (!m_Triton)
+    for (const auto& registrationPair : m_DynamicOpeningRegistrations)
+    {
+        UAcousticsDynamicOpening* opening = registrationPair.Key;
+        const FDynamicOpeningRegistration& registration = registrationPair.Value;
+        if (AddDynamicOpeningToRuntime(
+                m_Triton, opening, registration.Center, registration.Normal, registration.Vertices))
+        {
+            m_Triton->UpdateDynamicOpening(
+                reinterpret_cast<uint64_t>(opening), registration.DryAttenuationDb, registration.WetAttenuationDb);
+        }
+    }
+}
+
+bool FProjectAcousticsModule::AddDynamicOpening(
+    class UAcousticsDynamicOpening* opening, const FVector& center, const FVector& normal,
+    const TArray<FVector>& verticesIn)
+{
+    if (!opening || verticesIn.Num() == 0)
     {
         return false;
     }
 
-    return m_Triton->RemoveDynamicOpening(reinterpret_cast<uint64_t>(opening));
+    FDynamicOpeningRegistration& registration = m_DynamicOpeningRegistrations.FindOrAdd(opening);
+    registration.Center = center;
+    registration.Normal = normal;
+    registration.Vertices = verticesIn;
+
+    bool currentSuccess = AddDynamicOpeningToRuntime(m_Triton, opening, center, normal, verticesIn);
+    bool previousSuccess = true;
+    if (m_IsAceCrossfadeActive && m_PreviousTriton && m_PreviousAceFileLoaded)
+    {
+        previousSuccess = AddDynamicOpeningToRuntime(m_PreviousTriton, opening, center, normal, verticesIn);
+    }
+
+    return currentSuccess && previousSuccess;
+}
+
+bool FProjectAcousticsModule::RemoveDynamicOpening(class UAcousticsDynamicOpening* opening)
+{
+    if (!opening)
+    {
+        return false;
+    }
+
+    m_DynamicOpeningRegistrations.Remove(opening);
+
+    bool currentSuccess = m_Triton ? m_Triton->RemoveDynamicOpening(reinterpret_cast<uint64_t>(opening)) : false;
+    bool previousSuccess = true;
+    if (m_IsAceCrossfadeActive && m_PreviousTriton && m_PreviousAceFileLoaded)
+    {
+        previousSuccess = m_PreviousTriton->RemoveDynamicOpening(reinterpret_cast<uint64_t>(opening));
+    }
+
+    return currentSuccess && previousSuccess;
 }
 
 bool FProjectAcousticsModule::UpdateDynamicOpening(
     class UAcousticsDynamicOpening* opening, float dryAttenuationDb, float wetAttenuationDb)
 {
-    if (!m_Triton)
+    if (!opening)
     {
         return false;
     }
 
-    return m_Triton->UpdateDynamicOpening(reinterpret_cast<uint64_t>(opening), dryAttenuationDb, wetAttenuationDb);
+    if (FDynamicOpeningRegistration* registration = m_DynamicOpeningRegistrations.Find(opening))
+    {
+        registration->DryAttenuationDb = dryAttenuationDb;
+        registration->WetAttenuationDb = wetAttenuationDb;
+    }
+
+    bool currentSuccess = m_Triton
+        ? m_Triton->UpdateDynamicOpening(reinterpret_cast<uint64_t>(opening), dryAttenuationDb, wetAttenuationDb)
+        : false;
+    bool previousSuccess = true;
+    if (m_IsAceCrossfadeActive && m_PreviousTriton && m_PreviousAceFileLoaded)
+    {
+        previousSuccess = m_PreviousTriton->UpdateDynamicOpening(
+            reinterpret_cast<uint64_t>(opening), dryAttenuationDb, wetAttenuationDb);
+    }
+
+    return currentSuccess && previousSuccess;
 }
 
 bool FProjectAcousticsModule::SetGlobalDesign(const FAcousticsDesignParams& params)
@@ -273,17 +449,57 @@ AcousticQueryResults FProjectAcousticsModule::GetAcousticQueryResults(
     TritonDynamicOpeningInfo openingInfo = objectParams.DynamicOpeningInfo;
     InterpolationConfig interpConfig = objectParams.InterpolationConfig;
     AcousticQueryResults returnStruct = {};
+    bool querySuccess = false;
 
 #if !UE_BUILD_SHIPPING
     TritonRuntime::QueryDebugInfo queryDebugInfo;
-
-    bool querySuccess = GetAcousticParameters(
-        sourceLocation, listenerLocation, acousticParams, openingInfo, interpConfig, &queryDebugInfo);
-
-    returnStruct.QueryDebugInfo = queryDebugInfo;
+    TritonRuntime::QueryDebugInfo* queryDebugInfoPtr = &queryDebugInfo;
 #else
-    bool querySuccess =
-        GetAcousticParameters(sourceLocation, listenerLocation, acousticParams, openingInfo, interpConfig);
+    TritonRuntime::QueryDebugInfo* queryDebugInfoPtr = nullptr;
+#endif // !UE_BUILD_SHIPPING
+
+    if (m_IsAceCrossfadeActive && m_PreviousTriton && m_PreviousAceFileLoaded)
+    {
+        TritonAcousticParameters previousParams = {};
+        TritonDynamicOpeningInfo previousOpeningInfo = objectParams.DynamicOpeningInfo;
+        bool previousSuccess = GetAcousticParametersFromRuntime(
+            m_PreviousTriton, sourceLocation, listenerLocation, previousParams, previousOpeningInfo, interpConfig);
+
+        TritonAcousticParameters currentParams = {};
+        TritonDynamicOpeningInfo currentOpeningInfo = objectParams.DynamicOpeningInfo;
+        bool currentSuccess = GetAcousticParametersFromRuntime(
+            m_Triton, sourceLocation, listenerLocation, currentParams, currentOpeningInfo, interpConfig, queryDebugInfoPtr);
+
+        if (previousSuccess && currentSuccess)
+        {
+            const float alpha = m_AceCrossfadeDurationSeconds > 0.0f
+                ? FMath::Clamp(m_AceCrossfadeElapsedSeconds / m_AceCrossfadeDurationSeconds, 0.0f, 1.0f)
+                : 1.0f;
+            acousticParams = AcousticsParameterBlend::Blend(previousParams, currentParams, alpha);
+            openingInfo = alpha < 0.5f ? previousOpeningInfo : currentOpeningInfo;
+            querySuccess = true;
+        }
+        else if (currentSuccess)
+        {
+            acousticParams = currentParams;
+            openingInfo = currentOpeningInfo;
+            querySuccess = true;
+        }
+        else if (previousSuccess)
+        {
+            acousticParams = previousParams;
+            openingInfo = previousOpeningInfo;
+            querySuccess = true;
+        }
+    }
+    else
+    {
+        querySuccess = GetAcousticParameters(
+            sourceLocation, listenerLocation, acousticParams, openingInfo, interpConfig, queryDebugInfoPtr);
+    }
+
+#if !UE_BUILD_SHIPPING
+    returnStruct.QueryDebugInfo = queryDebugInfo;
 #endif // !UE_BUILD_SHIPPING
 
     returnStruct.AcousticParams = acousticParams;
@@ -671,6 +887,20 @@ bool FProjectAcousticsModule::GetAcousticParameters(
     const FVector& sourceLocation, const FVector& listenerLocation, TritonAcousticParameters& params,
     TritonDynamicOpeningInfo& outOpeningInfo, const InterpolationConfig& interpConfig, TritonRuntime::QueryDebugInfo* outDebugInfo /* = nullptr */)
 {
+    return GetAcousticParametersFromRuntime(
+        m_Triton, sourceLocation, listenerLocation, params, outOpeningInfo, interpConfig, outDebugInfo);
+}
+
+bool FProjectAcousticsModule::GetAcousticParametersFromRuntime(
+    TritonAcoustics* triton, const FVector& sourceLocation, const FVector& listenerLocation,
+    TritonAcousticParameters& params, TritonDynamicOpeningInfo& outOpeningInfo, const InterpolationConfig& interpConfig,
+    TritonRuntime::QueryDebugInfo* outDebugInfo /* = nullptr */)
+{
+    if (!triton)
+    {
+        return false;
+    }
+
     auto source = AcousticsUtils::ToTritonVectorDouble(WorldPositionToTriton(sourceLocation));
     auto listener = AcousticsUtils::ToTritonVectorDouble(WorldPositionToTriton(listenerLocation));
 
@@ -679,10 +909,17 @@ bool FProjectAcousticsModule::GetAcousticParameters(
         SCOPE_CYCLE_COUNTER(STAT_Acoustics_Query);
 
 #if !UE_BUILD_SHIPPING
-        acousticParamsValid = GetTritonDebugInstance()->QueryAcoustics(
-            source, listener, params, outOpeningInfo, &interpConfig, outDebugInfo);
+        if (outDebugInfo)
+        {
+            acousticParamsValid = static_cast<TritonAcousticsDebug*>(triton)->QueryAcoustics(
+                source, listener, params, outOpeningInfo, &interpConfig, outDebugInfo);
+        }
+        else
+        {
+            acousticParamsValid = triton->QueryAcoustics(source, listener, params, outOpeningInfo, &interpConfig);
+        }
 #else
-        acousticParamsValid = m_Triton->QueryAcoustics(source, listener, params, outOpeningInfo, &interpConfig);
+        acousticParamsValid = triton->QueryAcoustics(source, listener, params, outOpeningInfo, &interpConfig);
 #endif
     }
 

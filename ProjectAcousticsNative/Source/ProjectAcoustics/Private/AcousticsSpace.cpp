@@ -39,6 +39,7 @@ AAcousticsSpace::AAcousticsSpace(const class FObjectInitializer& ObjectInitializ
     AutoStream = true;
     UpdateDistances = false;
     CacheScale = 1.0f;
+    AceCrossfadeDurationSeconds = 2.0f;
 
     m_Acoustics = nullptr;
 
@@ -135,6 +136,7 @@ void AAcousticsSpace::Tick(float deltaSeconds)
     // Update global design tweaks
     {
         m_Acoustics->SetGlobalDesign(GlobalDesignParams);
+        m_Acoustics->TickAceCrossfade(deltaSeconds);
     }
 
     // Update things dependent only on listener
@@ -221,6 +223,35 @@ bool AAcousticsSpace::LoadAcousticsData(UAcousticsData* newData)
     }
     auto filePath = newData->AceFilePath;
     return LoadAceFile(filePath);
+}
+
+bool AAcousticsSpace::LoadAcousticsDataWithCrossfade(UAcousticsData* newData, float durationSeconds)
+{
+    if (!m_Acoustics || newData == nullptr)
+    {
+        return false;
+    }
+
+    const bool success = m_Acoustics->LoadAceFileForCrossfade(newData->AceFilePath, CacheScale, durationSeconds);
+    if (!success)
+    {
+        UE_LOG(LogAcousticsRuntime, Error, TEXT("Failed to crossfade-load ACE file [%s]"), *newData->AceFilePath);
+        return false;
+    }
+
+    AcousticsData = newData;
+    if (AutoStream)
+    {
+        auto listenerPosition = GetListenerPosition();
+        m_Acoustics->UpdateLoadedRegion(listenerPosition, TileSize, true, true, false);
+    }
+
+    return true;
+}
+
+bool AAcousticsSpace::IsAceCrossfadeActive() const
+{
+    return m_Acoustics ? m_Acoustics->IsAceCrossfadeActive() : false;
 }
 
 bool AAcousticsSpace::LoadAceFile(FString filePath)

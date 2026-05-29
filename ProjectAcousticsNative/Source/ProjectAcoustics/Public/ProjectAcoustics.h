@@ -96,6 +96,9 @@ public:
 
     // IAcoustics
     virtual bool LoadAceFile(const FString& filePath, const float cacheScale) override;
+    virtual bool LoadAceFileForCrossfade(const FString& filePath, const float cacheScale, const float durationSeconds) override;
+    virtual void TickAceCrossfade(float deltaSeconds) override;
+    virtual bool IsAceCrossfadeActive() const override;
     virtual void UnloadAceFile(bool clearOldQueries) override;
 
     virtual bool AddDynamicOpening(
@@ -174,6 +177,15 @@ public:
 #endif
 
 private:
+    struct FDynamicOpeningRegistration
+    {
+        FVector Center = FVector::ZeroVector;
+        FVector Normal = FVector::ForwardVector;
+        TArray<FVector> Vertices;
+        float DryAttenuationDb = 0.0f;
+        float WetAttenuationDb = 0.0f;
+    };
+
     // Triton members
     TritonRuntime::TritonAcoustics* m_Triton;
     bool m_TritonInstanceCreated;
@@ -184,11 +196,19 @@ private:
     TUniquePtr<TritonRuntime::FTritonLogHook> m_TritonLogHook;
     TUniquePtr<TritonRuntime::FTritonUnrealIOHook> m_TritonIOHook;
     TUniquePtr<TritonRuntime::FTritonAsyncTaskHook> m_TritonTaskHook;
+    TritonRuntime::TritonAcoustics* m_PreviousTriton;
+    bool m_PreviousAceFileLoaded;
+    TUniquePtr<TritonRuntime::FTritonUnrealIOHook> m_PreviousTritonIOHook;
+    TUniquePtr<TritonRuntime::FTritonAsyncTaskHook> m_PreviousTritonTaskHook;
+    bool m_IsAceCrossfadeActive;
+    float m_AceCrossfadeDurationSeconds;
+    float m_AceCrossfadeElapsedSeconds;
     bool m_IsOutdoornessStale;
     float m_CachedOutdoorness;
     FAcousticsDesignParams m_GlobalDesign;
     FTransform m_SpaceTransform;
     FTransform m_InverseSpaceTransform;
+    TMap<class UAcousticsDynamicOpening*, FDynamicOpeningRegistration> m_DynamicOpeningRegistrations;
 
     // Holds all async acoustic queries for each source before they've been returned to the caller
     // Key is the sourceID, value is the acoustic query results
@@ -213,6 +233,17 @@ private:
     bool GetAcousticParameters(
         const FVector& sourceLocation, const FVector& listenerLocation, TritonAcousticParameters& params,
         TritonDynamicOpeningInfo& outOpeningInfo, const TritonRuntime::InterpolationConfig& radiationDir, TritonRuntime::QueryDebugInfo* outDebugInfo = nullptr);
+    bool GetAcousticParametersFromRuntime(
+        TritonRuntime::TritonAcoustics* triton, const FVector& sourceLocation, const FVector& listenerLocation,
+        TritonAcousticParameters& params, TritonDynamicOpeningInfo& outOpeningInfo,
+        const TritonRuntime::InterpolationConfig& radiationDir,
+        TritonRuntime::QueryDebugInfo* outDebugInfo = nullptr);
+    bool LoadAceFileIntoCurrentRuntime(const FString& filePath, const float cacheScale);
+    void ClearPreviousRuntime();
+    bool AddDynamicOpeningToRuntime(
+        TritonRuntime::TritonAcoustics* triton, class UAcousticsDynamicOpening* opening, const FVector& center,
+        const FVector& normal, const TArray<FVector>& verticesIn);
+    void ReplayDynamicOpeningsToCurrentRuntime();
     void WaitForRunningTasks();
 };
 

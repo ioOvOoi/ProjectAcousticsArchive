@@ -21,3 +21,11 @@
 - 用户提供 triton-lang / microsoft triton-shared / triton-san 链接。已确认这些是深度学习 Triton 编译器生态，不是 Project Triton 音频声学 runtime 源码。
 - 用户决定回到 Project Acoustics 基础路线：先做“双 PA runtime / 双 ACE 高质量平滑切换”，用于静态建筑形态变化；动态修正层后续再做。
 - 已更新本状态目录目标与阶段。planning-with-files catchup 首次使用 `.claude` 路径失败，已记录；当前直接根据已读计划文件继续。
+- 已创建实施计划：`docs/superpowers/plans/2026-05-28-pa-dual-runtime-crossfade.md`。
+- 已实现首版原型：新增 `AcousticsParameterBlend.h`、blend automation test、`IAcoustics` crossfade 接口、`FProjectAcousticsModule::LoadAceFileForCrossfade/TickAceCrossfade/IsAceCrossfadeActive`、双 runtime 查询混合、`AAcousticsSpace::LoadAcousticsDataWithCrossfade/IsAceCrossfadeActive`。
+- 已补 dynamic opening 注册表和新 runtime 重放：ACE crossfade 后门窗 opening 不再丢失；切换中 opening 更新同步到旧/新 runtime。
+- 验证：`git diff --check` 通过，仅有 CRLF 工作区提示；`gitnexus_detect_changes(scope: all)` 风险 MEDIUM，受影响流程集中在 `UpdateObjectParameters` 查询链、`BeginPlay/PostEditChangeProperty` 加载链、`LoadAceFile` 清理链。
+- 用户提供宿主工程 `E:\WorkSpace\VillaBeta\VillaBeta.uproject` 和 UE 路径 `F:\EPIC\UE_5.7`。已把当前插件改动同步到宿主工程的 `Plugins/ProjectAcousticsArchive/ProjectAcousticsNative` 用于验证。
+- 编译验证：先因 XGE “Maximum number of concurrent builds reached” 失败，改用 `-NoXGE` 后成功。由于 VillaBeta 中 `ProjectAcoustics` 插件原本 disabled，自动化测试首次找不到；临时启用后重新编译 ProjectAcoustics 模块成功。最终命令：`Build.bat VillaBetaEditor Win64 Development E:\WorkSpace\VillaBeta\VillaBeta.uproject -WaitMutex -NoHotReloadFromIDE -NoUBTMakefiles -NoXGE`，结果 `Result: Succeeded`。
+- 自动化测试验证：`UnrealEditor-Cmd.exe E:\WorkSpace\VillaBeta\VillaBeta.uproject -ExecCmds="Automation RunTests ProjectAcoustics.Crossfade.BlendsAcousticParameters; Quit" -unattended -nop4 -nosplash`；第一次测试期望范围写错，修正 dry loudness energy blend 预期后，日志显示 `Test Completed. Result={成功}` 和 `**** TEST COMPLETE. EXIT CODE: 0 ****`。
+- 已将 `VillaBeta.uproject` 恢复到原状态（ProjectAcoustics 仍 disabled）；宿主工程仍有未跟踪 `Plugins/ProjectAcousticsArchive/` 插件目录用于验证。

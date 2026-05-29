@@ -119,3 +119,12 @@
 - 目标不是让 GPU 数据进入 `Triton.Runtime.lib`，而是同时保留旧/新 PA runtime 查询结果，在插件层混合参数。
 - 最小原型应先解决生命周期和查询路径：当前 ACE、过渡来源 ACE、过渡进度、结束释放旧 runtime。
 - 主要风险：Triton 是否支持同进程多个 runtime 实例、`UAcousticsData`/`FProjectAcousticsModule` 是否天然单例化、异步查询缓存是否可携带双数据来源、线程安全、内存/查询成本翻倍。
+
+## 2026-05-28 双 runtime 原型实现发现
+
+- `TritonPublicInterface.h` 暴露 `TritonAcoustics::CreateInstance()` / `DestroyInstance()`，公开接口形态允许一个进程中创建多个 Triton runtime 实例；真实稳定性仍需用两个有效 `.ACE` 文件验证。
+- 原型采用“当前 `m_Triton` + 旧 `m_PreviousTriton`”最小改法，避免大规模重构 `FProjectAcousticsModule`。
+- 切换完成释放旧 runtime 前必须 `WaitForRunningTasks()`，否则后台声学查询可能仍在使用旧 runtime。
+- 已补 dynamic opening 注册表：`AddDynamicOpening` 保存 center/normal/vertices，`UpdateDynamicOpening` 保存 dry/wet attenuation，`RemoveDynamicOpening` 删除注册；新 runtime 加载成功后调用重放，把已存在门窗 opening 复制到新 runtime。
+- crossfade 过程中新增/删除/更新 opening 会同步作用到当前 runtime 和 previous runtime，避免旧/新 ACE 查询看到不同 opening 状态。
+- 当前原型 outdoorness、distance query、debug voxel/probe 仍来自当前 runtime，不做旧/新混合；首版聚焦声源 acoustic parameters 平滑。

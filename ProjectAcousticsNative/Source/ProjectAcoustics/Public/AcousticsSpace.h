@@ -69,6 +69,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Acoustics")
     FAcousticsDesignParams GlobalDesignParams;
 
+    /////////////////// CROSSFADE CONTROLS //////////////////
+    /** Default duration for ACE-to-ACE acoustic parameter crossfades. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Acoustics|Crossfade")
+    float AceCrossfadeDurationSeconds;
+
     /////////////////// DEBUG CONTROLS //////////////////
 
     /** Toggle acoustic effects on or off. In the off state, the effects
@@ -130,6 +135,14 @@ public:
         Returns true on success, false if there was a problem loading/unloading the data. */
     UFUNCTION(BlueprintCallable, Category = "Acoustics")
     bool LoadAcousticsData(UAcousticsData* newBake);
+
+    /** Load the specified ACE data while smoothly blending from the currently loaded ACE. */
+    UFUNCTION(BlueprintCallable, Category = "Acoustics|Crossfade")
+    bool LoadAcousticsDataWithCrossfade(UAcousticsData* newBake, float durationSeconds);
+
+    /** Return whether an ACE crossfade transition is currently active. */
+    UFUNCTION(BlueprintCallable, Category = "Acoustics|Crossfade")
+    bool IsAceCrossfadeActive() const;
 
     /** Get distance from listener looking in given direction using an internal
      * baked distance map that is updated if UpdateDistances is true.

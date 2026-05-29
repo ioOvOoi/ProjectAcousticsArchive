@@ -50,6 +50,11 @@ public:
      */
     virtual bool LoadAceFile(const FString& filePath, const float cacheScale) = 0;
 
+    /** Load a new ACE file while keeping the current ACE alive for a timed parameter crossfade. */
+    virtual bool LoadAceFileForCrossfade(const FString& filePath, const float cacheScale, const float durationSeconds) = 0;
+    virtual void TickAceCrossfade(float deltaSeconds) = 0;
+    virtual bool IsAceCrossfadeActive() const = 0;
+
     /**
      * Unload the currently loaded ACE file.
      *
