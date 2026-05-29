@@ -65,6 +65,251 @@ In the level editor toolbar, click the **Modes** dropdown and select **Bake Acou
 
 ---
 
+## 更新日志 / Changelog
+
+### 2026-05-29 — `2d317032bbc47cb4612ebfff54229a4d4094801e`
+
+**提交标题：** `✨ feat(acoustics): 实现双运行时 ACE 交叉淡入淡出`
+
+本次提交为 Project Acoustics Unreal 插件增加了 **双 Triton 运行时（dual Triton runtime）/ 双 ACE 交叉淡入淡出（crossfade）** 原型。目标是应对静态建筑状态切换，例如“完整建筑 ACE → 坍塌建筑 ACE”，在运行时平滑混合两套 `.ACE` 查询结果，避免声学参数突然跳变。
+
+#### 功能概览
+
+- 新增 `IAcoustics` 接口：`LoadAceFileForCrossfade(...)`、`TickAceCrossfade(...)`、`IsAceCrossfadeActive()`。
+- `FProjectAcousticsModule` 支持同时持有当前 `m_Triton` 和旧 `m_PreviousTriton`。
+- 交叉淡入期间，声源查询会同时查询旧/新 Triton runtime，并混合 `TritonAcousticParameters`。
+- 新增 `AcousticsParameterBlend.h`：dB 响度先转能量域再混合，方向向量混合后归一化，路径长度、扩散角、衰减时间线性混合。
+- `AAcousticsSpace` 增加蓝图入口：`AceCrossfadeDurationSeconds`、`LoadAcousticsDataWithCrossfade(...)`、`IsAceCrossfadeActive()`。
+- 动态开口（dynamic opening）增加注册表：新 runtime 加载后自动重放已注册门窗开口；交叉淡入期间新增、删除、更新 opening 会同步到旧/新 runtime。
+- 交叉淡入结束后等待后台查询任务完成，再释放旧 runtime。
+- 新增自动化测试 `ProjectAcoustics.Crossfade.BlendsAcousticParameters`，验证参数混合逻辑。
+
+#### 关键代码片段
+
+新增运行时接口：
+
+```cpp
+virtual bool LoadAceFileForCrossfade(const FString& filePath, const float cacheScale, const float durationSeconds) = 0;
+virtual void TickAceCrossfade(float deltaSeconds) = 0;
+virtual bool IsAceCrossfadeActive() const = 0;
+```
+
+新增蓝图入口：
+
+```cpp
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Acoustics|Crossfade")
+float AceCrossfadeDurationSeconds;
+
+UFUNCTION(BlueprintCallable, Category = "Acoustics|Crossfade")
+bool LoadAcousticsDataWithCrossfade(UAcousticsData* newBake, float durationSeconds);
+
+UFUNCTION(BlueprintCallable, Category = "Acoustics|Crossfade")
+bool IsAceCrossfadeActive() const;
+```
+
+声学参数混合逻辑：
+
+```cpp
+inline float BlendDb(float FromDb, float ToDb, float Alpha)
+{
+    Alpha = ClampAlpha(Alpha);
+    return PowerToDb(FMath::Lerp(DbToPower(FromDb), DbToPower(ToDb), Alpha));
+}
+
+inline TritonAcousticParameters Blend(
+    const TritonAcousticParameters& From,
+    const TritonAcousticParameters& To,
+    float Alpha)
+{
+    Alpha = ClampAlpha(Alpha);
+
+    TritonAcousticParameters Result = To;
+    Result.Dry.PathLengthMeters = FMath::Lerp(From.Dry.PathLengthMeters, To.Dry.PathLengthMeters, Alpha);
+    Result.Dry.LoudnessDb = BlendDb(From.Dry.LoudnessDb, To.Dry.LoudnessDb, Alpha);
+    Result.Dry.ArrivalDirection = BlendDirection(From.Dry.ArrivalDirection, To.Dry.ArrivalDirection, Alpha);
+
+    Result.Wet.LoudnessDb = BlendDb(From.Wet.LoudnessDb, To.Wet.LoudnessDb, Alpha);
+    Result.Wet.ArrivalDirection = BlendDirection(From.Wet.ArrivalDirection, To.Wet.ArrivalDirection, Alpha);
+    Result.Wet.AngularSpreadDegrees = FMath::Lerp(From.Wet.AngularSpreadDegrees, To.Wet.AngularSpreadDegrees, Alpha);
+    Result.Wet.DecayTimeSeconds = FMath::Lerp(From.Wet.DecayTimeSeconds, To.Wet.DecayTimeSeconds, Alpha);
+
+    return Result;
+}
+```
+
+双 runtime 切换核心：
+
+```cpp
+bool FProjectAcousticsModule::LoadAceFileForCrossfade(
+    const FString& filePath, const float cacheScale, const float durationSeconds)
+{
+    if (!m_AceFileLoaded || durationSeconds <= 0.0f)
+    {
+        return LoadAceFile(filePath, cacheScale);
+    }
+
+    WaitForRunningTasks();
+    ClearPreviousRuntime();
+
+    m_PreviousTriton = m_Triton;
+    m_PreviousAceFileLoaded = m_AceFileLoaded;
+    m_PreviousTritonIOHook = MoveTemp(m_TritonIOHook);
+    m_PreviousTritonTaskHook = MoveTemp(m_TritonTaskHook);
+
+    m_Triton = TritonAcoustics::CreateInstance();
+    m_AceFileLoaded = false;
+
+    if (!m_Triton || !LoadAceFileIntoCurrentRuntime(filePath, cacheScale))
+    {
+        m_Triton = m_PreviousTriton;
+        m_AceFileLoaded = m_PreviousAceFileLoaded;
+        m_TritonIOHook = MoveTemp(m_PreviousTritonIOHook);
+        m_TritonTaskHook = MoveTemp(m_PreviousTritonTaskHook);
+        m_PreviousTriton = nullptr;
+        m_PreviousAceFileLoaded = false;
+        return false;
+    }
+
+    ReplayDynamicOpeningsToCurrentRuntime();
+
+    m_IsAceCrossfadeActive = true;
+    m_AceCrossfadeDurationSeconds = durationSeconds;
+    m_AceCrossfadeElapsedSeconds = 0.0f;
+    return true;
+}
+```
+
+查询阶段混合旧/新 ACE 参数：
+
+```cpp
+if (m_IsAceCrossfadeActive && m_PreviousTriton && m_PreviousAceFileLoaded)
+{
+    bool previousSuccess = GetAcousticParametersFromRuntime(
+        m_PreviousTriton, sourceLocation, listenerLocation, previousParams, previousOpeningInfo, interpConfig);
+
+    bool currentSuccess = GetAcousticParametersFromRuntime(
+        m_Triton, sourceLocation, listenerLocation, currentParams, currentOpeningInfo, interpConfig, queryDebugInfoPtr);
+
+    if (previousSuccess && currentSuccess)
+    {
+        const float alpha = FMath::Clamp(m_AceCrossfadeElapsedSeconds / m_AceCrossfadeDurationSeconds, 0.0f, 1.0f);
+        acousticParams = AcousticsParameterBlend::Blend(previousParams, currentParams, alpha);
+        openingInfo = alpha < 0.5f ? previousOpeningInfo : currentOpeningInfo;
+        querySuccess = true;
+    }
+}
+```
+
+动态开口注册表与重放：
+
+```cpp
+struct FDynamicOpeningRegistration
+{
+    FVector Center = FVector::ZeroVector;
+    FVector Normal = FVector::ForwardVector;
+    TArray<FVector> Vertices;
+    float DryAttenuationDb = 0.0f;
+    float WetAttenuationDb = 0.0f;
+};
+
+TMap<class UAcousticsDynamicOpening*, FDynamicOpeningRegistration> m_DynamicOpeningRegistrations;
+```
+
+```cpp
+void FProjectAcousticsModule::ReplayDynamicOpeningsToCurrentRuntime()
+{
+    for (const auto& registrationPair : m_DynamicOpeningRegistrations)
+    {
+        UAcousticsDynamicOpening* opening = registrationPair.Key;
+        const FDynamicOpeningRegistration& registration = registrationPair.Value;
+        if (AddDynamicOpeningToRuntime(
+                m_Triton, opening, registration.Center, registration.Normal, registration.Vertices))
+        {
+            m_Triton->UpdateDynamicOpening(
+                reinterpret_cast<uint64_t>(opening), registration.DryAttenuationDb, registration.WetAttenuationDb);
+        }
+    }
+}
+```
+
+过渡结束释放旧 runtime：
+
+```cpp
+void FProjectAcousticsModule::TickAceCrossfade(float deltaSeconds)
+{
+    if (!m_IsAceCrossfadeActive)
+    {
+        return;
+    }
+
+    m_AceCrossfadeElapsedSeconds += FMath::Max(0.0f, deltaSeconds);
+    if (m_AceCrossfadeElapsedSeconds >= m_AceCrossfadeDurationSeconds)
+    {
+        WaitForRunningTasks();
+        ClearPreviousRuntime();
+    }
+}
+```
+
+#### 修改文件
+
+- `.gitignore`
+- `ProjectAcousticsNative/Source/ProjectAcoustics/Private/AcousticsParameterBlend.h`
+- `ProjectAcousticsNative/Source/ProjectAcoustics/Private/AcousticsSpace.cpp`
+- `ProjectAcousticsNative/Source/ProjectAcoustics/Private/ProjectAcoustics.cpp`
+- `ProjectAcousticsNative/Source/ProjectAcoustics/Private/Tests/AcousticsParameterBlendTests.cpp`
+- `ProjectAcousticsNative/Source/ProjectAcoustics/Public/AcousticsSpace.h`
+- `ProjectAcousticsNative/Source/ProjectAcoustics/Public/IAcoustics.h`
+- `ProjectAcousticsNative/Source/ProjectAcoustics/Public/ProjectAcoustics.h`
+- `docs/superpowers/plans/2026-05-28-ray-tracing-audio-ddgi/findings.md`
+- `docs/superpowers/plans/2026-05-28-ray-tracing-audio-ddgi/progress.md`
+
+#### 验证记录
+
+编译验证：
+
+```powershell
+ Win64 Development E:\WorkSpace\VillaBeta\VillaBeta.uproject -WaitMutex -NoHotReloadFromIDE -NoUBTMakefiles -NoXGE
+```
+
+结果：
+
+```text
+Result: Succeeded
+```
+
+自动化测试：
+
+```powershell
+UnrealEditor-Cmd.exe -ExecCmds="Automation RunTests ProjectAcoustics.Crossfade.BlendsAcousticParameters; Quit" -unattended -nop4 -nosplash
+```
+
+结果：
+
+```text
+Test Completed. Result={成功}
+**** TEST COMPLETE. EXIT CODE: 0 ****
+```
+
+#### 使用方式
+
+在蓝图或 C++ 中加载目标 ACE 数据时，调用：
+
+```cpp
+AcousticsSpace->LoadAcousticsDataWithCrossfade(NewAcousticsData, 2.0f);
+```
+
+其中 `2.0f` 表示旧 ACE 到新 ACE 的声学参数过渡时间，单位为秒。
+
+#### 注意事项
+
+- 该功能不是运行时重新烘焙，也不会修改 Triton 内部算法。
+- 它适合“多个预烘焙静态状态之间平滑切换”，例如完整建筑 ACE 与坍塌建筑 ACE。
+- crossfade 期间会同时查询两个 Triton runtime，查询成本和内存占用会临时升高。
+- 真实听感仍需要使用两个有效 `.ACE` 文件在关卡中测试。
+
+---
+
 ## TODO / 待办
 - [ ] **创建一个 Demo 关卡** / **Create a Demo Level**
 - [ ] **添加使用说明** / **Add Instructions for Usage**
